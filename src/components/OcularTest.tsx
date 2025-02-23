@@ -14,7 +14,9 @@ type Point = {
 // Constants
 const GRID_SIZE = 20;
 const TEST_DURATION = 5000;
-const STEP_SIZE = 3;
+const STEP_SIZE = 2;
+const MAX_RADIUS = 12;
+const MIN_RADIUS = 2;
 
 // Initial focal points for each test
 const FOCAL_POINTS = {
@@ -32,20 +34,29 @@ const INITIAL_SECONDARY_POSITIONS = {
   4: { x: 15, y: 5 },  // Q2 top right
 };
 
-type GridMap = Map<string, boolean>; // key is "x,y", value is whether it's been tested
+// Angle ranges for testing adjacent quadrants
+const QUADRANT_ANGLES = {
+  1: { start: 3 * Math.PI / 4, end: 5 * Math.PI / 4 },     // Test Q3 when focal in Q1
+  2: { start: 5 * Math.PI / 4, end: 7 * Math.PI / 4 },     // Test Q4 when focal in Q2
+  3: { start: -Math.PI / 4, end: Math.PI / 4 },            // Test Q1 when focal in Q3
+  4: { start: Math.PI / 4, end: 3 * Math.PI / 4 }          // Test Q2 when focal in Q4
+};
+
+type GridMap = Map<string, boolean>;
 
 const OcularTest = () => {
-  const [currentTest, setCurrentTest] = useState(1);
-  const [testActive, setTestActive] = useState(false);
+  const [testState, setTestState] = useState({
+    currentTest: 1,
+    testActive: false,
+    timeLeft: TEST_DURATION,
+    showSecondaryDot: true,
+    radius: MAX_RADIUS,
+  });
+
   const [focalPoint, setFocalPoint] = useState<Point>({ x: 4, y: 4, seen: true });
   const [secondaryPoint, setSecondaryPoint] = useState<Point>({ x: 15, y: 15, seen: false });
-  const [timeLeft, setTimeLeft] = useState(TEST_DURATION);
-  const [showSecondaryDot, setShowSecondaryDot] = useState(true);
   const [testedPoints, setTestedPoints] = useState<Point[]>([]);
-  const [currentLine, setCurrentLine] = useState<{ start: Point; end: Point } | null>(null);
-  const [radius, setRadius] = useState(8);
   const [testedLocations, setTestedLocations] = useState<GridMap>(new Map());
-  const [isMovingInward, setIsMovingInward] = useState(false);
 
   const isLocationTested = useCallback((x: number, y: number) => {
     return testedLocations.has(`${Math.round(x)},${Math.round(y)}`);
@@ -59,49 +70,6 @@ const OcularTest = () => {
     });
   }, []);
 
-  // Timer effect
-  useEffect(() => {
-    if (testActive && timeLeft > 0) {
-      const timer = setInterval(() => {
-        setTimeLeft(prev => prev - 100);
-      }, 100);
-      return () => clearInterval(timer);
-    } else if (timeLeft <= 0 && testActive) {
-      handleTimeout();
-    }
-  }, [testActive, timeLeft]);
-
-  // Blink effect
-  useEffect(() => {
-    if (testActive) {
-      const blinkInterval = setInterval(() => {
-        setShowSecondaryDot(prev => !prev);
-      }, 500);
-      return () => clearInterval(blinkInterval);
-    }
-  }, [testActive]);
-
-  // Calculate next point along current line
-  const calculateNextLinearPoint = useCallback(() => {
-    if (!currentLine) return null;
-    
-    const dx = currentLine.end.x - currentLine.start.x;
-    const dy = currentLine.end.y - currentLine.start.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    
-    if (distance <= STEP_SIZE) return currentLine.end;
-    
-    const ratio = (distance - STEP_SIZE) / distance;
-    const newPoint = {
-      x: Math.round(currentLine.end.x - dx * ratio),
-      y: Math.round(currentLine.end.y - dy * ratio),
-      seen: false
-    };
-  
-    // Constrain the point to stay within grid boundaries
-    return constrainToGrid(newPoint);
-  }, [currentLine]);
-
   const constrainToGrid = (point: Point): Point => {
     return {
       x: Math.max(0, Math.min(GRID_SIZE - 1, point.x)),
@@ -110,110 +78,149 @@ const OcularTest = () => {
     };
   };
 
-  // Calculate next semi-circle point
-  const calculateNextSemiCirclePoint = useCallback(() => {
-    // Try up to 20 times to find an untested location
-    for (let attempt = 0; attempt < 20; attempt++) {
-      let angle;
-      switch(currentTest) {
-        case 1: angle = Math.PI * (1.25 + Math.random() * 0.5); break;
-        case 2: angle = Math.PI * (1.75 + Math.random() * 0.5); break;
-        case 3: angle = Math.PI * (0.25 + Math.random() * 0.5); break;
-        case 4: angle = Math.PI * (0.75 + Math.random() * 0.5); break;
-        default: angle = Math.random() * Math.PI;
+  const isInPrimaryTestQuadrant = useCallback((point: Point) => {
+    // Define quadrant boundaries with some margin
+    const margin = 2;
+    const midX = GRID_SIZE/2;
+    const midY = GRID_SIZE/2;
+    
+    // Testing areas should focus on the quadrant where the initial secondary dot was placed
+    switch(testState.currentTest) {
+      case 1: // When focal in Q1, test primarily in Q3
+        return point.x >= midX - margin && point.y >= midY - margin;
+      case 2: // When focal in Q2, test primarily in Q4
+        return point.x <= midX + margin && point.y >= midY - margin;
+      case 3: // When focal in Q3, test primarily in Q1
+        return point.x <= midX + margin && point.y <= midY + margin;
+      case 4: // When focal in Q4, test primarily in Q2
+        return point.x >= midX - margin && point.y <= midY + margin;
+      default:
+        return false;
+    }
+  }, [testState.currentTest]);
+
+  const getNextInwardPoint = useCallback((fromPoint: Point) => {
+    // Calculate vector from focal point to current point
+    const dx = fromPoint.x - focalPoint.x;
+    const dy = fromPoint.y - focalPoint.y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    
+    // Move 2 squares closer to focal point along the same line
+    const ratio = (distance - STEP_SIZE) / distance;
+    const newX = Math.round(focalPoint.x + dx * ratio);
+    const newY = Math.round(focalPoint.y + dy * ratio);
+    
+    return constrainToGrid({ x: newX, y: newY, seen: false });
+  }, [focalPoint]);
+
+  const calculateNextPoint = useCallback(() => {
+    // If the last point wasn't seen, move inward along the same line
+    const lastPoint = testedPoints[testedPoints.length - 1];
+    if (lastPoint && !lastPoint.seen && isInPrimaryTestQuadrant(lastPoint)) {
+      console.log('Moving inward from unseen point:', lastPoint);
+      const nextPoint = getNextInwardPoint(lastPoint);
+      // Only return if the point hasn't been tested yet
+      if (!isLocationTested(nextPoint.x, nextPoint.y)) {
+        console.log('Next inward point:', nextPoint);
+        return nextPoint;
       }
+    }
 
-      const x = Math.round(focalPoint.x + radius * Math.cos(angle));
-      const y = Math.round(focalPoint.y + radius * Math.sin(angle));
-
-      // Check if this location has been tested
-      if (!isLocationTested(x, y)) {
+    // If not moving inward, find a new untested point in the primary quadrant
+    const angles = QUADRANT_ANGLES[testState.currentTest as keyof typeof QUADRANT_ANGLES];
+    console.log('Looking for new point in primary quadrant', {
+      currentTest: testState.currentTest,
+      angleRange: angles
+    });
+    
+    // Start from the initial secondary position and sweep inward
+    const initialPosition = INITIAL_SECONDARY_POSITIONS[testState.currentTest as keyof typeof INITIAL_SECONDARY_POSITIONS];
+    const dx = initialPosition.x - focalPoint.x;
+    const dy = initialPosition.y - focalPoint.y;
+    const maxDistance = Math.sqrt(dx * dx + dy * dy);
+    
+    // Try points at decreasing distances from the initial position
+    for (let distance = maxDistance; distance >= MIN_RADIUS; distance -= STEP_SIZE) {
+      // Try multiple angles at each distance
+      for (let i = 0; i < 8; i++) {
+        const baseAngle = Math.atan2(dy, dx);
+        const angleOffset = (i - 4) * Math.PI / 16; // Spread around the base angle
+        const angle = baseAngle + angleOffset;
+        
+        const x = Math.round(focalPoint.x + distance * Math.cos(angle));
+        const y = Math.round(focalPoint.y + distance * Math.sin(angle));
+        
         const point = constrainToGrid({ x, y, seen: false });
-        // If the constrained point is also untested, use it
-        if (!isLocationTested(point.x, point.y)) {
+        
+        // Check if this point is valid and untested
+        if (isInPrimaryTestQuadrant(point) && !isLocationTested(point.x, point.y)) {
+          console.log('Found new test point:', point);
           return point;
         }
       }
     }
-
-    // If we couldn't find an untested location at this radius, 
-    // decrease radius and try again
-    if (radius > 2) {
-      setRadius(prev => Math.max(prev - 2, 2));
-      return calculateNextSemiCirclePoint();
-    }
-
-    // If we've tested all points at minimum radius, end the test
-    setTestActive(false);
+    
+    console.log('No more valid points found, ending test');
     return null;
-  }, [currentTest, focalPoint, radius, isLocationTested]);
+  }, [testedPoints, testState.currentTest, focalPoint, isInPrimaryTestQuadrant, isLocationTested, getNextInwardPoint]);
 
-  const distanceToFocalPoint = (point: Point) => {
-    const dx = point.x - focalPoint.x;
-    const dy = point.y - focalPoint.y;
-    return Math.sqrt(dx * dx + dy * dy);
-  };
   const handleTimeout = useCallback(() => {
-    // Record current point as unseen
+    // Mark current point as not seen
     const updatedPoint = { ...secondaryPoint, seen: false };
     setTestedPoints(prev => [...prev, updatedPoint]);
     markLocationTested(updatedPoint);
 
-    let nextPoint;
-    if (!isMovingInward) {
-      // First unseen point, start moving inward along line
-      setIsMovingInward(true);
-      const newRadius = Math.max(radius - 2, 2);
-      setRadius(newRadius);
-      nextPoint = calculateNextLinearPoint();
-    } else {
-      // Already moving inward, continue along line
-      nextPoint = calculateNextLinearPoint();
-      if (!nextPoint || distanceToFocalPoint(nextPoint) < 2) {
-        // If we're too close to focal point, start a new line
-        setIsMovingInward(false);
-        setRadius(8); // Reset to initial radius
-        nextPoint = calculateNextSemiCirclePoint();
-      }
-    }
-
+    const nextPoint = calculateNextPoint();
     if (nextPoint) {
       setSecondaryPoint(nextPoint);
-      setCurrentLine({
-        start: nextPoint,
-        end: focalPoint
-      });
-      setTimeLeft(TEST_DURATION);
+      setTestState(prev => ({ ...prev, timeLeft: TEST_DURATION }));
+    } else {
+      setTestState(prev => ({ ...prev, testActive: false }));
     }
-  }, [secondaryPoint, calculateNextSemiCirclePoint, calculateNextLinearPoint, focalPoint, radius, markLocationTested, isMovingInward]);
+  }, [secondaryPoint, calculateNextPoint, markLocationTested]);
 
   const handleKeyPress = useCallback((event: KeyboardEvent) => {
-    if (event.code === 'Space' && testActive) {
+    if (event.code === 'Space' && testState.testActive) {
       const updatedPoint = { ...secondaryPoint, seen: true };
       setTestedPoints(prev => [...prev, updatedPoint]);
       markLocationTested(updatedPoint);
-  
-      // If we were moving inward and found a seen point, 
-      // start a new line from the outer radius
-      setIsMovingInward(false);
-      setRadius(8); // Reset to initial radius
-      
-      const nextPoint = calculateNextSemiCirclePoint();
+
+      const nextPoint = calculateNextPoint();
       if (nextPoint) {
         setSecondaryPoint(nextPoint);
-        setCurrentLine({
-          start: nextPoint,
-          end: focalPoint
-        });
-        setTimeLeft(TEST_DURATION);
+        setTestState(prev => ({ ...prev, timeLeft: TEST_DURATION }));
+      } else {
+        setTestState(prev => ({ ...prev, testActive: false }));
       }
     }
-  }, [testActive, secondaryPoint, calculateNextSemiCirclePoint, focalPoint, markLocationTested]);  
+  }, [testState.testActive, secondaryPoint, calculateNextPoint, markLocationTested]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [handleKeyPress]);
+
+  // Timer effect
+  useEffect(() => {
+    if (testState.testActive && testState.timeLeft > 0) {
+      const timer = setInterval(() => {
+        setTestState(prev => ({ ...prev, timeLeft: prev.timeLeft - 100 }));
+      }, 100);
+      return () => clearInterval(timer);
+    } else if (testState.timeLeft <= 0 && testState.testActive) {
+      handleTimeout();
+    }
+  }, [testState.testActive, testState.timeLeft, handleTimeout]);
+
+  // Blink effect
+  useEffect(() => {
+    if (testState.testActive) {
+      const blinkInterval = setInterval(() => {
+        setTestState(prev => ({ ...prev, showSecondaryDot: !prev.showSecondaryDot }));
+      }, 500);
+      return () => clearInterval(blinkInterval);
+    }
+  }, [testState.testActive]);
 
   const startTest = (testNumber: number) => {
     const newFocalPoint = constrainToGrid({ 
@@ -224,21 +231,18 @@ const OcularTest = () => {
       ...INITIAL_SECONDARY_POSITIONS[testNumber as keyof typeof INITIAL_SECONDARY_POSITIONS], 
       seen: false 
     });
-    setIsMovingInward(false);
-    setRadius(8);
-    setTestedLocations(new Map());
-    setCurrentTest(testNumber);
+    
+    setTestState({
+      currentTest: testNumber,
+      testActive: true,
+      timeLeft: TEST_DURATION,
+      showSecondaryDot: true,
+      radius: MAX_RADIUS,
+    });
     setFocalPoint(newFocalPoint);
     setSecondaryPoint(initialSecondary);
     setTestedPoints([]);
-    setTimeLeft(TEST_DURATION);
-    setTestActive(true);
-    setRadius(8);
-    setTestedLocations(new Map()); // Reset tested locations
-    setCurrentLine({
-      start: initialSecondary,
-      end: newFocalPoint
-    });
+    setTestedLocations(new Map());
   };
 
   return (
@@ -251,19 +255,19 @@ const OcularTest = () => {
               <Button 
                 key={testNum}
                 onClick={() => startTest(testNum)}
-                disabled={testActive}
+                disabled={testState.testActive}
                 className="px-4 py-2"
               >
                 Start Test {testNum}
               </Button>
             ))}
           </div>
-          {testActive && (
+          {testState.testActive && (
             <div className="mb-4">
               <div className="h-2 bg-gray-200 rounded">
                 <div 
                   className="h-2 bg-blue-500 rounded transition-all"
-                  style={{ width: `${(timeLeft / TEST_DURATION) * 100}%` }}
+                  style={{ width: `${(testState.timeLeft / TEST_DURATION) * 100}%` }}
                 />
               </div>
             </div>
@@ -296,7 +300,7 @@ const OcularTest = () => {
           ))}
 
           {/* Focal point */}
-          {testActive && (
+          {testState.testActive && (
             <div 
               className="absolute w-3 h-3 bg-black rounded-full transform -translate-x-1/2 -translate-y-1/2"
               style={{
@@ -307,7 +311,7 @@ const OcularTest = () => {
           )}
 
           {/* Secondary blinking point */}
-          {testActive && showSecondaryDot && (
+          {testState.testActive && testState.showSecondaryDot && (
             <div 
               className="absolute w-3 h-3 bg-blue-500 rounded-full transform -translate-x-1/2 -translate-y-1/2"
               style={{
@@ -328,7 +332,6 @@ const OcularTest = () => {
               }}
             />
           ))}
-
         </div>
 
         {/* Results display */}
