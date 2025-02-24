@@ -13,8 +13,8 @@ type Point = {
 
 // Constants
 const GRID_SIZE = 20;
-const TEST_DURATION = 5000;
-const STEP_SIZE = 2;
+const TEST_DURATION = 5000; // Changed to 5 seconds as per requirement
+const STEP_SIZE = 1;
 const MAX_RADIUS = 12;
 const MIN_RADIUS = 2;
 
@@ -34,14 +34,6 @@ const INITIAL_SECONDARY_POSITIONS = {
   4: { x: 15, y: 5 },  // Q2 top right
 };
 
-// Angle ranges for testing adjacent quadrants
-const QUADRANT_ANGLES = {
-  1: { start: 3 * Math.PI / 4, end: 5 * Math.PI / 4 },     // Test Q3 when focal in Q1
-  2: { start: 5 * Math.PI / 4, end: 7 * Math.PI / 4 },     // Test Q4 when focal in Q2
-  3: { start: -Math.PI / 4, end: Math.PI / 4 },            // Test Q1 when focal in Q3
-  4: { start: Math.PI / 4, end: 3 * Math.PI / 4 }          // Test Q2 when focal in Q4
-};
-
 type GridMap = Map<string, boolean>;
 
 const OcularTest = () => {
@@ -51,24 +43,37 @@ const OcularTest = () => {
     timeLeft: TEST_DURATION,
     showSecondaryDot: true,
     radius: MAX_RADIUS,
+    currentSweepAngle: 0,
+    currentTestRadius: MAX_RADIUS
   });
 
   const [focalPoint, setFocalPoint] = useState<Point>({ x: 4, y: 4, seen: true });
   const [secondaryPoint, setSecondaryPoint] = useState<Point>({ x: 15, y: 15, seen: false });
   const [testedPoints, setTestedPoints] = useState<Point[]>([]);
   const [testedLocations, setTestedLocations] = useState<GridMap>(new Map());
+  
+  // Store boundary points - key is angle (in radians), value is distance
+  const [boundaryPoints, setBoundaryPoints] = useState<Map<number, number>>(new Map());
+
+  // Even more precise point key to ensure we never test the same location twice
+  const getPointKey = (x: number, y: number) => {
+    // Use two decimal places for better precision
+    return `${Math.round(x * 100) / 100},${Math.round(y * 100) / 100}`;
+  };
 
   const isLocationTested = useCallback((x: number, y: number) => {
-    return testedLocations.has(`${Math.round(x)},${Math.round(y)}`);
+    return testedLocations.has(getPointKey(x, y));
   }, [testedLocations]);
 
   const markLocationTested = useCallback((point: Point) => {
     setTestedLocations(prev => {
       const newMap = new Map(prev);
-      newMap.set(`${Math.round(point.x)},${Math.round(point.y)}`, true);
+      newMap.set(getPointKey(point.x, point.y), true);
       return newMap;
     });
-  }, []);
+    
+    // Removed numbered indicator for testing sequence
+  }, [testedPoints.length]);
 
   const constrainToGrid = (point: Point): Point => {
     return {
@@ -79,96 +84,187 @@ const OcularTest = () => {
   };
 
   const isInPrimaryTestQuadrant = useCallback((point: Point) => {
-    // Define quadrant boundaries with some margin
-    const margin = 2;
-    const midX = GRID_SIZE/2;
-    const midY = GRID_SIZE/2;
+    // Define quadrant boundaries
+    const midX = GRID_SIZE / 2;
+    const midY = GRID_SIZE / 2;
     
-    // Testing areas should focus on the quadrant where the initial secondary dot was placed
     switch(testState.currentTest) {
       case 1: // When focal in Q1, test primarily in Q3
-        return point.x >= midX - margin && point.y >= midY - margin;
+        return point.x >= midX && point.y >= midY;
       case 2: // When focal in Q2, test primarily in Q4
-        return point.x <= midX + margin && point.y >= midY - margin;
+        return point.x < midX && point.y >= midY;
       case 3: // When focal in Q3, test primarily in Q1
-        return point.x <= midX + margin && point.y <= midY + margin;
+        return point.x < midX && point.y < midY;
       case 4: // When focal in Q4, test primarily in Q2
-        return point.x >= midX - margin && point.y <= midY + margin;
+        return point.x >= midX && point.y < midY;
       default:
         return false;
     }
   }, [testState.currentTest]);
 
-  const getNextInwardPoint = useCallback((fromPoint: Point) => {
-    // Calculate vector from focal point to current point
-    const dx = fromPoint.x - focalPoint.x;
-    const dy = fromPoint.y - focalPoint.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
+  // Calculate angle from focal point to a point
+  const getAngle = (point: Point): number => {
+    return Math.atan2(point.y - focalPoint.y, point.x - focalPoint.x);
+  };
+
+  // Calculate distance from focal point to a point
+  const getDistance = (point: Point): number => {
+    const dx = point.x - focalPoint.x;
+    const dy = point.y - focalPoint.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  };
+
+  // Check if a point is beyond the current boundary
+  const isBeyondBoundary = useCallback((point: Point): boolean => {
+    const angle = getAngle(point);
+    const distance = getDistance(point);
     
-    // Move 2 squares closer to focal point along the same line
-    const ratio = (distance - STEP_SIZE) / distance;
-    const newX = Math.round(focalPoint.x + dx * ratio);
-    const newY = Math.round(focalPoint.y + dy * ratio);
+    // Discretize angle to match our boundary storage (round to nearest 0.01 radians for more precision)
+    const roundedAngle = Math.round(angle * 100) / 100;
     
-    return constrainToGrid({ x: newX, y: newY, seen: false });
+    // Find the nearest angles in our boundary
+    let found = false;
+    let minDistance = Number.MAX_VALUE;
+    
+    // Check if there's a boundary point at this angle or nearby
+    boundaryPoints.forEach((boundaryDistance, boundaryAngle) => {
+      const angleDiff = Math.abs(boundaryAngle - roundedAngle);
+      if (angleDiff < 0.15) { // Within about 8-9 degrees for more precision
+        found = true;
+        minDistance = Math.min(minDistance, boundaryDistance);
+      }
+    });
+    
+    // If we have a boundary point in this direction,
+    // only test points further out than the boundary
+    return !found || distance > minDistance;
+  }, [boundaryPoints, focalPoint]);
+
+  // Add a point to the boundary if it's seen
+  const updateBoundary = useCallback((point: Point) => {
+    if (point.seen) {
+      const angle = getAngle(point);
+      const distance = getDistance(point);
+      const roundedAngle = Math.round(angle * 100) / 100;
+      
+      setBoundaryPoints(prev => {
+        const newBoundary = new Map(prev);
+        
+        // Only update if we don't have a boundary point at this angle yet
+        // or if this point is farther from the focal point
+        if (!newBoundary.has(roundedAngle) || distance > newBoundary.get(roundedAngle)!) {
+          newBoundary.set(roundedAngle, distance);
+        }
+        
+        return newBoundary;
+      });
+    }
   }, [focalPoint]);
 
   const calculateNextPoint = useCallback(() => {
-    // If the last point wasn't seen, move inward along the same line
-    const lastPoint = testedPoints[testedPoints.length - 1];
-    if (lastPoint && !lastPoint.seen && isInPrimaryTestQuadrant(lastPoint)) {
-      console.log('Moving inward from unseen point:', lastPoint);
-      const nextPoint = getNextInwardPoint(lastPoint);
-      // Only return if the point hasn't been tested yet
-      if (!isLocationTested(nextPoint.x, nextPoint.y)) {
-        console.log('Next inward point:', nextPoint);
-        return nextPoint;
+    const baseAngle = Math.PI * (testState.currentTest - 1) / 2; // Base direction based on test
+    
+    // Strategy: Sweep radially with increasing angles
+    let radius = testState.currentTestRadius;
+    let angle = testState.currentSweepAngle;
+    
+    // Try up to 360 different angle positions with more granularity
+    for (let i = 0; i < 360; i++) {
+      const testAngle = baseAngle + angle;
+      const newX = Math.round(focalPoint.x + radius * Math.cos(testAngle));
+      const newY = Math.round(focalPoint.y + radius * Math.sin(testAngle));
+      const newPoint = constrainToGrid({ x: newX, y: newY, seen: false });
+      
+      if (isInPrimaryTestQuadrant(newPoint) && 
+          !isLocationTested(newPoint.x, newPoint.y) && 
+          isBeyondBoundary(newPoint)) {
+            
+        // Update the sweep angle for next time
+        setTestState(prev => ({
+          ...prev,
+          currentSweepAngle: (angle + 0.2) % (2 * Math.PI) // Increment by about 11 degrees
+        }));
+        
+        return newPoint;
+      }
+      
+      // Try the next angle
+      angle = (angle + 0.01) % (2 * Math.PI); // More granular angle increments
+    }
+    
+    // If we couldn't find a point at this radius, try reducing the radius
+    if (radius > MIN_RADIUS) {
+      setTestState(prev => ({
+        ...prev,
+        currentTestRadius: prev.currentTestRadius - STEP_SIZE,
+        currentSweepAngle: 0 // Reset angle when changing radius
+      }));
+      
+      // Try again with a smaller radius
+      radius -= STEP_SIZE;
+      angle = 0;
+      
+      for (let i = 0; i < 360; i++) {
+        const testAngle = baseAngle + angle;
+        const newX = Math.round(focalPoint.x + radius * Math.cos(testAngle));
+        const newY = Math.round(focalPoint.y + radius * Math.sin(testAngle));
+        const newPoint = constrainToGrid({ x: newX, y: newY, seen: false });
+        
+        if (isInPrimaryTestQuadrant(newPoint) && 
+            !isLocationTested(newPoint.x, newPoint.y) && 
+            isBeyondBoundary(newPoint)) {
+              
+          // Update the sweep angle for next time
+          setTestState(prev => ({
+            ...prev,
+            currentSweepAngle: (angle + 0.2) % (2 * Math.PI)
+          }));
+          
+          return newPoint;
+        }
+        
+        // Try the next angle
+        angle = (angle + 0.01) % (2 * Math.PI); // More granular angle increments
       }
     }
-
-    // If not moving inward, find a new untested point in the primary quadrant
-    const angles = QUADRANT_ANGLES[testState.currentTest as keyof typeof QUADRANT_ANGLES];
-    console.log('Looking for new point in primary quadrant', {
-      currentTest: testState.currentTest,
-      angleRange: angles
-    });
     
-    // Start from the initial secondary position and sweep inward
-    const initialPosition = INITIAL_SECONDARY_POSITIONS[testState.currentTest as keyof typeof INITIAL_SECONDARY_POSITIONS];
-    const dx = initialPosition.x - focalPoint.x;
-    const dy = initialPosition.y - focalPoint.y;
-    const maxDistance = Math.sqrt(dx * dx + dy * dy);
-    
-    // Try points at decreasing distances from the initial position
-    for (let distance = maxDistance; distance >= MIN_RADIUS; distance -= STEP_SIZE) {
-      // Try multiple angles at each distance
-      for (let i = 0; i < 8; i++) {
-        const baseAngle = Math.atan2(dy, dx);
-        const angleOffset = (i - 4) * Math.PI / 16; // Spread around the base angle
-        const angle = baseAngle + angleOffset;
-        
-        const x = Math.round(focalPoint.x + distance * Math.cos(angle));
-        const y = Math.round(focalPoint.y + distance * Math.sin(angle));
-        
-        const point = constrainToGrid({ x, y, seen: false });
-        
-        // Check if this point is valid and untested
-        if (isInPrimaryTestQuadrant(point) && !isLocationTested(point.x, point.y)) {
-          console.log('Found new test point:', point);
-          return point;
+    // If we still couldn't find a point, try expanding the radius to find gaps
+    if (testedPoints.length > 0) {
+      for (let expandedRadius = MAX_RADIUS; expandedRadius > MIN_RADIUS; expandedRadius -= STEP_SIZE) {
+        for (let i = 0; i < 360; i++) {
+          const testAngle = i * Math.PI / 180; // Full 360-degree sweep with 1-degree precision
+          const newX = Math.round(focalPoint.x + expandedRadius * Math.cos(testAngle));
+          const newY = Math.round(focalPoint.y + expandedRadius * Math.sin(testAngle));
+          const newPoint = constrainToGrid({ x: newX, y: newY, seen: false });
+          
+          if (isInPrimaryTestQuadrant(newPoint) && 
+              !isLocationTested(newPoint.x, newPoint.y) && 
+              isBeyondBoundary(newPoint)) {
+            return newPoint;
+          }
         }
       }
     }
     
-    console.log('No more valid points found, ending test');
+    // No more points to test
     return null;
-  }, [testedPoints, testState.currentTest, focalPoint, isInPrimaryTestQuadrant, isLocationTested, getNextInwardPoint]);
+  }, [
+    testState.currentTest, 
+    testState.currentSweepAngle, 
+    testState.currentTestRadius, 
+    focalPoint, 
+    isInPrimaryTestQuadrant, 
+    isLocationTested, 
+    isBeyondBoundary,
+    testedPoints.length
+  ]);
 
   const handleTimeout = useCallback(() => {
     // Mark current point as not seen
     const updatedPoint = { ...secondaryPoint, seen: false };
     setTestedPoints(prev => [...prev, updatedPoint]);
     markLocationTested(updatedPoint);
+    updateBoundary(updatedPoint);
 
     const nextPoint = calculateNextPoint();
     if (nextPoint) {
@@ -177,13 +273,14 @@ const OcularTest = () => {
     } else {
       setTestState(prev => ({ ...prev, testActive: false }));
     }
-  }, [secondaryPoint, calculateNextPoint, markLocationTested]);
+  }, [secondaryPoint, calculateNextPoint, markLocationTested, updateBoundary]);
 
   const handleKeyPress = useCallback((event: KeyboardEvent) => {
     if (event.code === 'Space' && testState.testActive) {
       const updatedPoint = { ...secondaryPoint, seen: true };
       setTestedPoints(prev => [...prev, updatedPoint]);
       markLocationTested(updatedPoint);
+      updateBoundary(updatedPoint);
 
       const nextPoint = calculateNextPoint();
       if (nextPoint) {
@@ -193,7 +290,7 @@ const OcularTest = () => {
         setTestState(prev => ({ ...prev, testActive: false }));
       }
     }
-  }, [testState.testActive, secondaryPoint, calculateNextPoint, markLocationTested]);
+  }, [testState.testActive, secondaryPoint, calculateNextPoint, markLocationTested, updateBoundary]);
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyPress);
@@ -238,11 +335,14 @@ const OcularTest = () => {
       timeLeft: TEST_DURATION,
       showSecondaryDot: true,
       radius: MAX_RADIUS,
+      currentSweepAngle: 0,
+      currentTestRadius: MAX_RADIUS
     });
     setFocalPoint(newFocalPoint);
     setSecondaryPoint(initialSecondary);
     setTestedPoints([]);
     setTestedLocations(new Map());
+    setBoundaryPoints(new Map());
   };
 
   return (
@@ -270,6 +370,7 @@ const OcularTest = () => {
                   style={{ width: `${(testState.timeLeft / TEST_DURATION) * 100}%` }}
                 />
               </div>
+              <p className="text-sm mt-1">Press SPACE when you see the blue dot</p>
             </div>
           )}
         </div>
@@ -330,7 +431,9 @@ const OcularTest = () => {
                 left: `${(point.x / GRID_SIZE) * 100}%`,
                 top: `${(point.y / GRID_SIZE) * 100}%`
               }}
-            />
+            >
+
+            </div>
           ))}
         </div>
 
@@ -340,6 +443,10 @@ const OcularTest = () => {
           <p>Total points tested: {testedPoints.length}</p>
           <p>Blind spots found: {testedPoints.filter(p => !p.seen).length}</p>
           <p>Visible points: {testedPoints.filter(p => p.seen).length}</p>
+          <p className="mt-2 text-xs text-gray-500">
+            Stare at the black dot and press SPACE when you see the blue dot.
+            If you don&apos;t see the blue dot within 5 seconds, it will move to a new location.
+          </p>
         </div>
       </CardContent>
     </Card>
