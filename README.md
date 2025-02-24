@@ -17,7 +17,7 @@ The final grid highlights potential vision loss, often forming a semi-circle or 
 
 In the picture below, the numbers on some of the dots to give you an idea of the sequence these were displayed to the patient.
 
-[<img src="images/demo.png">]
+<img src="images/demo.png">
 
 ## Getting Started
 
